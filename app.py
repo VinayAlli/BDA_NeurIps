@@ -1,7 +1,7 @@
 import streamlit as st
 import numpy as np
 import tensorflow as tf
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer, AutoModel
 from tensorflow.keras.datasets import imdb
 from tensorflow.keras.preprocessing import sequence
 from tensorflow.keras.models import load_model
@@ -14,6 +14,13 @@ import os
 from deepface import DeepFace
 from ultralytics import YOLO
 from tensorflow.keras import layers, models
+import torch
+import torch.nn as nn
+from torchvision import transforms
+from PIL import Image
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 @st.cache_data
 def load_word_index():
@@ -35,18 +42,84 @@ def load_text_generator():
 def load_yolo_model():
     return YOLO("yolov8n.pt")
 
-# New: Small MLP model for feature fusion
+@st.cache_resource
+def load_text_encoder():
+    tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+    model = AutoModel.from_pretrained("distilbert-base-uncased").to(device)
+    return tokenizer, model
+
 @st.cache_resource
 def load_fusion_model():
     model = models.Sequential([
-        layers.Input(shape=(7,)),  # 1 text score + 6 emotion scores
+        layers.Input(shape=(7,)),
         layers.Dense(16, activation='relu'),
-        layers.Dense(1, activation='sigmoid')  # Output: probability of positive sentiment
+        layers.Dense(1, activation='sigmoid')
     ])
     model.compile(optimizer='adam', loss='binary_crossentropy')
     return model
 
-# Preprocessing
+class VideoEncoder(nn.Module):
+    def __init__(self):
+        super(VideoEncoder, self).__init__()
+        self.conv1 = nn.Conv1d(3, 64, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=7, padding=3)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.relu(self.conv3(x))
+        return x.mean(dim=2)
+
+class ConsensusTransformer(nn.Module):
+    def __init__(self, hidden_dim=256):
+        super(ConsensusTransformer, self).__init__()
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+
+    def forward(self, x):
+        return self.transformer(x)
+
+class GoldenGrounding(nn.Module):
+    def __init__(self, hidden_dim=256):
+        super(GoldenGrounding, self).__init__()
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.relu(out)
+        return out.mean(dim=1)
+
+class FusionClassifier(nn.Module):
+    def __init__(self, input_dim=768+256):
+        super(FusionClassifier, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2_opinion = nn.Linear(128, 3)
+        self.fc2_emotion = nn.Linear(128, 8)
+
+    def forward(self, fused):
+        x = torch.relu(self.fc1(fused))
+        opinion = self.fc2_opinion(x)
+        emotion = self.fc2_emotion(x)
+        return opinion, emotion
+
+class VCCSAModel(nn.Module):
+    def __init__(self):
+        super(VCCSAModel, self).__init__()
+        self.video_encoder = VideoEncoder()
+        self.text_encoder_dim = 768
+        self.consensus = ConsensusTransformer()
+        self.golden = GoldenGrounding()
+        self.fusion = FusionClassifier()
+
+    def forward(self, video_feats, text_feats):
+        x_video = self.video_encoder(video_feats.permute(0, 2, 1))
+        x_text = text_feats
+        combined = torch.cat((x_video, x_text), dim=1)
+        opinion, emotion = self.fusion(combined)
+        return opinion, emotion
 
 def preprocess_text(text, word_index, vocab_size=10000):
     words = text.lower().split()
@@ -65,101 +138,41 @@ def generate_explanation(text, generator):
     output = generator(prompt, max_length=100)[0]['generated_text']
     return output
 
-def embedding_demo(sentence, voc_size=10000, sent_length=8, dim=10):
-    one_hot_repr = [min(idx, voc_size - 1) for idx in one_hot(sentence, voc_size)]
-    padded_seq = pad_sequences([one_hot_repr], maxlen=sent_length, padding='pre')
-    model = tf.keras.Sequential()
-    model.add(Embedding(voc_size, dim, input_length=sent_length))
-    model.compile('adam', 'mse')
-    embeddings = model.predict(padded_seq)
-    return padded_seq, embeddings
-
-# New: Extract full emotion scores from DeepFace analysis
-
-def extract_emotion_scores(face_result):
-    emotions = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
-    scores = [face_result['emotion'].get(e, 0) for e in emotions]
-    return scores
-
-# New: Perform feature-level fusion with text and emotion features
-
-def feature_fusion(text_score, emotion_scores):
-    features = np.array([text_score] + emotion_scores).reshape(1, -1)
-    fusion_model = load_fusion_model()
-    fused_output = fusion_model.predict(features)[0][0]
-    if fused_output > 0.6:
-        return "Strongly Positive"
-    elif fused_output < 0.4:
-        return "Strongly Negative"
-    else:
-        return "Mixed Sentiment"
-
-# Modified: Full DeepFace output for emotions
-
-def analyze_image(image_file, return_full_face=False):
-    suffix = os.path.splitext(image_file.name)[-1]
-    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tfile.write(image_file.read())
-    tfile.flush()
-    img_path = tfile.name
-    tfile.close()
-
-    yolo_model = load_yolo_model()
-    yolo_results = yolo_model(img_path)[0]
-    yolo_labels = [yolo_model.names[int(cls)] for cls in yolo_results.boxes.cls]
-
-    try:
-        face_result = DeepFace.analyze(img_path, actions=['emotion'], enforce_detection=False)[0]
-        emotion = face_result['dominant_emotion']
-    except:
-        face_result = None
-        emotion = "Face not detected"
-
-    if return_full_face:
-        return yolo_labels, face_result
-    else:
-        return yolo_labels, emotion
-
-def analyze_video(video_file):
+def extract_frames_from_video(video_file, max_frames=16):
     tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     tfile.write(video_file.read())
     cap = cv2.VideoCapture(tfile.name)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    sample_rate = max(frame_count // 10, 1)
-
-    yolo_model = load_yolo_model()
-    object_counts = {}
-    emotions = []
-    frame_idx = 0
-
-    while cap.isOpened():
+    frames = []
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    sample_rate = max(total // max_frames, 1)
+    count = 0
+    while cap.isOpened() and len(frames) < max_frames:
         ret, frame = cap.read()
         if not ret:
             break
-        if frame_idx % sample_rate == 0:
-            tmp_path = os.path.join(tempfile.gettempdir(), f"frame_{frame_idx}.jpg")
-            cv2.imwrite(tmp_path, frame)
-            yolo_results = yolo_model(tmp_path)[0]
-            for cls in yolo_results.boxes.cls:
-                label = yolo_model.names[int(cls)]
-                object_counts[label] = object_counts.get(label, 0) + 1
-            try:
-                face_result = DeepFace.analyze(tmp_path, actions=['emotion'], enforce_detection=False)[0]
-                emotions.append(face_result['dominant_emotion'])
-            except:
-                pass
-        frame_idx += 1
-
+        if count % sample_rate == 0:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.resize(frame, (64, 64))
+            frames.append(frame)
+        count += 1
     cap.release()
-    dominant_objects = sorted(object_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-    dominant_emotion = max(set(emotions), key=emotions.count) if emotions else "None"
-    return dominant_objects, dominant_emotion
+    frames = np.stack(frames, axis=0)
+    frames = frames / 255.0
+    return torch.tensor(frames, dtype=torch.float32).unsqueeze(0).to(device)
+
+def extract_text_features(text, tokenizer, model):
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True).to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    return outputs.last_hidden_state[:, 0, :]
+
+opinion_labels = ["Positive", "Negative", "Neutral"]
+emotion_labels = ["Fear", "Disgust", "Anger", "Sadness", "Joy", "Trust", "Anticipation", "Surprise"]
 
 # Streamlit App
-
 st.sidebar.title("Navigation")
 choice = st.sidebar.selectbox("Choose a feature", [
-    "Sentiment Analysis", "RAG-Based Explanation", "Word Embedding Demo", "Image Sentiment Analysis", "Video Sentiment Analysis"])
+    "Sentiment Analysis", "RAG-Based Explanation", "Word Embedding Demo", "Image Sentiment Analysis", "Video Sentiment Analysis", "VC-CSA Sentiment Analysis"])
 
 if choice == "Sentiment Analysis":
     st.title("Text Sentiment Analysis with Simple RNN")
@@ -188,34 +201,19 @@ elif choice == "Word Embedding Demo":
         st.write("**Padded Sequence**:", padded)
         st.write("**Embedding Vector**:", embedding[0])
 
-elif choice == "Image Sentiment Analysis":
-    st.title("Image-Based Sentiment Analysis with Feature Fusion")
-    uploaded_img = st.file_uploader("Upload an Image", type=['jpg', 'jpeg', 'png'])
-    text_input = st.text_input("Enter accompanying text for fusion:")
-    if uploaded_img and st.button("Analyze Image"):
-        model = load_sentiment_model()
-        word_index = load_word_index()
-        sentiment, text_score = predict_sentiment(text_input, model, word_index)
-        labels, face_result = analyze_image(uploaded_img, return_full_face=True)
-        if face_result:
-            emotion_scores = extract_emotion_scores(face_result)
-            fusion = feature_fusion(text_score, emotion_scores)
-        else:
-            fusion = "Face not detected"
-        st.image(uploaded_img, caption='Uploaded Image', use_column_width=True)
-        st.write("**Detected Objects**:", labels)
-        st.write("**Fusion Sentiment (Feature-level)**:", fusion)
-
-elif choice == "Video Sentiment Analysis":
-    st.title("Video-Based Sentiment Analysis")
-    uploaded_video = st.file_uploader("Upload a Video", type=['mp4'])
-    text_input = st.text_input("Enter accompanying text for fusion:")
-    if uploaded_video and st.button("Analyze Video"):
-        model = load_sentiment_model()
-        word_index = load_word_index()
-        sentiment, _ = predict_sentiment(text_input, model, word_index)
-        objects, emotion = analyze_video(uploaded_video)
-        fusion = fuse_sentiment(sentiment, emotion)
-        st.write("**Top Detected Objects**:", objects)
-        st.write("**Dominant Emotion**:", emotion)
-        st.write("**Fused Sentiment**:", fusion)
+elif choice == "VC-CSA Sentiment Analysis":
+    st.title("VC-CSA Based Induced Sentiment Analysis")
+    video_file = st.file_uploader("Upload a Video File (.mp4)", type=['mp4'])
+    comment_text = st.text_input("Enter Viewer Comment:")
+    if video_file and comment_text and st.button("Analyze Sentiment (VC-CSA)"):
+        with st.spinner("Processing..."):
+            tokenizer, text_model = load_text_encoder()
+            vccsa_model = VCCSAModel().to(device)
+            vccsa_model.eval()
+            frames = extract_frames_from_video(video_file)
+            text_feats = extract_text_features(comment_text, tokenizer, text_model)
+            opinion_logits, emotion_logits = vccsa_model(frames, text_feats)
+            opinion_pred = opinion_logits.argmax(dim=1).item()
+            emotion_pred = emotion_logits.argmax(dim=1).item()
+            st.success(f"**Predicted Opinion:** {opinion_labels[opinion_pred]}")
+            st.success(f"**Predicted Emotion:** {emotion_labels[emotion_pred]}")
