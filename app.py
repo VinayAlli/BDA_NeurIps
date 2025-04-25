@@ -1,7 +1,7 @@
 import streamlit as st
 import numpy as np
 import tensorflow as tf
-from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+from transformers import pipeline
 from tensorflow.keras.datasets import imdb
 from tensorflow.keras.preprocessing import sequence
 from tensorflow.keras.models import load_model
@@ -13,12 +13,12 @@ import tempfile
 import os
 from deepface import DeepFace
 from ultralytics import YOLO
+from tensorflow.keras import layers, models
 
 @st.cache_data
 def load_word_index():
     return imdb.get_word_index()
 
-#Model
 @st.cache_resource
 def load_sentiment_model():
     class CustomSimpleRNN(OriginalSimpleRNN):
@@ -27,29 +27,44 @@ def load_sentiment_model():
             super().__init__(*args, **kwargs)
     return load_model('simple_rnn_imdb.h5', custom_objects={'SimpleRNN': CustomSimpleRNN})
 
-#Preprocess
+@st.cache_resource
+def load_text_generator():
+    return pipeline("text-generation", model="gpt2")
+
+@st.cache_resource
+def load_yolo_model():
+    return YOLO("yolov8n.pt")
+
+# New: Small MLP model for feature fusion
+@st.cache_resource
+def load_fusion_model():
+    model = models.Sequential([
+        layers.Input(shape=(7,)),  # 1 text score + 6 emotion scores
+        layers.Dense(16, activation='relu'),
+        layers.Dense(1, activation='sigmoid')  # Output: probability of positive sentiment
+    ])
+    model.compile(optimizer='adam', loss='binary_crossentropy')
+    return model
+
+# Preprocessing
+
 def preprocess_text(text, word_index, vocab_size=10000):
     words = text.lower().split()
     encoded_review = [word_index.get(word, 2) + 3 for word in words]
-    # Clip all indices to ensure they're in [0, vocab_size - 1]
     encoded_review = [min(idx, vocab_size - 1) for idx in encoded_review]
     return sequence.pad_sequences([encoded_review], maxlen=500)
+
 def predict_sentiment(text, model, word_index):
     preprocessed = preprocess_text(text, word_index)
     prediction = model.predict(preprocessed)
     sentiment = "Positive" if prediction[0][0] > 0.7 else "Negative"
     return sentiment, float(prediction[0][0])
 
-# Loading GPT-2 model for generation
-@st.cache_resource
-def load_text_generator():
-    return pipeline("text-generation", model="gpt2")
 def generate_explanation(text, generator):
     prompt = f"Review: {text}\nSentiment:"
     output = generator(prompt, max_length=100)[0]['generated_text']
     return output
 
-# Word embedding demo
 def embedding_demo(sentence, voc_size=10000, sent_length=8, dim=10):
     one_hot_repr = [min(idx, voc_size - 1) for idx in one_hot(sentence, voc_size)]
     padded_seq = pad_sequences([one_hot_repr], maxlen=sent_length, padding='pre')
@@ -59,34 +74,51 @@ def embedding_demo(sentence, voc_size=10000, sent_length=8, dim=10):
     embeddings = model.predict(padded_seq)
     return padded_seq, embeddings
 
-# Load YOLOv8 model
-@st.cache_resource
-def load_yolo_model():
-    return YOLO("yolov8n.pt")
+# New: Extract full emotion scores from DeepFace analysis
 
-def analyze_image(image_file):
-    # Save uploaded image to temp file with known extension
+def extract_emotion_scores(face_result):
+    emotions = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
+    scores = [face_result['emotion'].get(e, 0) for e in emotions]
+    return scores
+
+# New: Perform feature-level fusion with text and emotion features
+
+def feature_fusion(text_score, emotion_scores):
+    features = np.array([text_score] + emotion_scores).reshape(1, -1)
+    fusion_model = load_fusion_model()
+    fused_output = fusion_model.predict(features)[0][0]
+    if fused_output > 0.6:
+        return "Strongly Positive"
+    elif fused_output < 0.4:
+        return "Strongly Negative"
+    else:
+        return "Mixed Sentiment"
+
+# Modified: Full DeepFace output for emotions
+
+def analyze_image(image_file, return_full_face=False):
     suffix = os.path.splitext(image_file.name)[-1]
     tfile = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tfile.write(image_file.read())
-    tfile.flush()  # Ensure data is written
+    tfile.flush()
     img_path = tfile.name
     tfile.close()
 
-    # Load YOLO model
     yolo_model = load_yolo_model()
     yolo_results = yolo_model(img_path)[0]
     yolo_labels = [yolo_model.names[int(cls)] for cls in yolo_results.boxes.cls]
 
-    # DeepFace analysis
     try:
         face_result = DeepFace.analyze(img_path, actions=['emotion'], enforce_detection=False)[0]
         emotion = face_result['dominant_emotion']
     except:
+        face_result = None
         emotion = "Face not detected"
 
-    return yolo_labels, emotion
-
+    if return_full_face:
+        return yolo_labels, face_result
+    else:
+        return yolo_labels, emotion
 
 def analyze_video(video_file):
     tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
@@ -122,14 +154,8 @@ def analyze_video(video_file):
     dominant_objects = sorted(object_counts.items(), key=lambda x: x[1], reverse=True)[:5]
     dominant_emotion = max(set(emotions), key=emotions.count) if emotions else "None"
     return dominant_objects, dominant_emotion
-# Fusion logic
-def fuse_sentiment(text_sentiment, image_emotion):
-    if text_sentiment == "Positive" and image_emotion in ["happy", "surprise"]:
-        return "Strongly Positive"
-    elif text_sentiment == "Negative" and image_emotion in ["angry", "sad"]:
-        return "Strongly Negative"
-    else:
-        return "Mixed Sentiment"
+
+# Streamlit App
 
 st.sidebar.title("Navigation")
 choice = st.sidebar.selectbox("Choose a feature", [
@@ -163,19 +189,22 @@ elif choice == "Word Embedding Demo":
         st.write("**Embedding Vector**:", embedding[0])
 
 elif choice == "Image Sentiment Analysis":
-    st.title("Image-Based Sentiment Analysis")
+    st.title("Image-Based Sentiment Analysis with Feature Fusion")
     uploaded_img = st.file_uploader("Upload an Image", type=['jpg', 'jpeg', 'png'])
     text_input = st.text_input("Enter accompanying text for fusion:")
     if uploaded_img and st.button("Analyze Image"):
         model = load_sentiment_model()
         word_index = load_word_index()
-        sentiment, _ = predict_sentiment(text_input, model, word_index)
-        labels, emotion = analyze_image(uploaded_img)
-        fusion = fuse_sentiment(sentiment, emotion)
+        sentiment, text_score = predict_sentiment(text_input, model, word_index)
+        labels, face_result = analyze_image(uploaded_img, return_full_face=True)
+        if face_result:
+            emotion_scores = extract_emotion_scores(face_result)
+            fusion = feature_fusion(text_score, emotion_scores)
+        else:
+            fusion = "Face not detected"
         st.image(uploaded_img, caption='Uploaded Image', use_column_width=True)
         st.write("**Detected Objects**:", labels)
-        st.write("**Facial Emotion**:", emotion)
-        st.write("**Fused Sentiment**:", fusion)
+        st.write("**Fusion Sentiment (Feature-level)**:", fusion)
 
 elif choice == "Video Sentiment Analysis":
     st.title("Video-Based Sentiment Analysis")
