@@ -1,0 +1,10 @@
+tensorflow
+keras
+tf-keras
+streamlit
+transformers
+torch
+ultralytics
+opencv-python
+deepface
+numpy
